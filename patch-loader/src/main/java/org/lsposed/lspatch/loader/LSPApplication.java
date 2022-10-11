@@ -12,6 +12,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.content.res.CompatibilityInfo;
+import android.content.res.Resources;
 import android.os.Build;
 import android.os.Looper;
 import android.os.Message;
@@ -40,6 +41,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -49,10 +51,14 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.BiConsumer;
+import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import hidden.HiddenApiBridge;
 
@@ -67,8 +73,6 @@ public class LSPApplication {
     private static final String TAG = "LSPatch";
 
     private static ActivityThread activityThread;
-    private static LoadedApk stubLoadedApk;
-    private static LoadedApk appLoadedApk;
 
     private static PatchConfig config;
     private static final Map<String, String> signatures = new HashMap<>();
@@ -83,84 +87,123 @@ public class LSPApplication {
             return;
         }
         activityThread = ActivityThread.currentActivityThread();
-        var context = createLoadedApkWithContext();
-        if (context == null) {
+        Log.i(TAG, "Create stub Context");
+        var stubContext = createStubContext();
+        if (stubContext == null) {
             XLog.e(TAG, "Error when creating context");
             return;
         }
+
+        Log.i(TAG, "Load config");
+        config = loadConfig(stubContext);
+        if (config == null) {
+            Log.e(TAG, "Failed to load config file");
+            return;
+        }
+        Log.i(TAG, "Use manager: " + config.useManager);
+        Log.i(TAG, "Signature bypass level: " + config.sigBypassLevel);
 
         try {
             Log.d(TAG, "Initialize service client");
             ILSPApplicationService service;
             if (config.useManager) {
-                service = new RemoteApplicationService(context);
+                service = new RemoteApplicationService(stubContext);
             } else {
-                service = new LocalApplicationService(context);
+                service = new LocalApplicationService(stubContext);
             }
 
-            disableProfile(context);
+            disableProfile(stubContext);
+
+            // start Main.forkCommon
             Startup.initXposed(false, ActivityThread.currentProcessName(), service);
             Log.i(TAG, "Bootstrap Xposed");
             Startup.bootstrapXposed();
-            // WARN: Since it uses `XResource`, the following class should not be initialized
-            // before forkPostCommon is invoke. Otherwise, you will get failure of XResources
-            Log.i(TAG, "Load modules");
-            LSPLoader.initModules(appLoadedApk);
-            Log.i(TAG, "Modules initialized");
+            Log.i(TAG, "Xposed ready");
+            // end Main.forkCommon
 
-            switchAllClassLoader();
-            doSigBypass(context);
+            Log.i(TAG, "Prepare cache apk");
+            String cacheApk = prepareCacheApk(stubContext);
+
+            Log.i(TAG, "SigBypass");
+            doSigBypass(stubContext);
+
+            Log.i(TAG, "Switch to new LoadedApk");
+            // load xposed modules same as lsposed with zygisk
+            switchLoadedApk(stubContext, cacheApk);
+
         } catch (Throwable e) {
             throw new RuntimeException("Do hook", e);
         }
         Log.i(TAG, "LSPatch bootstrap completed");
     }
 
-    private static Context createLoadedApkWithContext() {
-        try {
-            var mBoundApplication = XposedHelpers.getObjectField(activityThread, "mBoundApplication");
-
-            stubLoadedApk = (LoadedApk) XposedHelpers.getObjectField(mBoundApplication, "info");
-            var appInfo = (ApplicationInfo) XposedHelpers.getObjectField(mBoundApplication, "appInfo");
-            var compatInfo = (CompatibilityInfo) XposedHelpers.getObjectField(mBoundApplication, "compatInfo");
-            var baseClassLoader = stubLoadedApk.getClassLoader();
-
-            try (var is = baseClassLoader.getResourceAsStream(CONFIG_ASSET_PATH)) {
-                BufferedReader streamReader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
-                config = new Gson().fromJson(streamReader, PatchConfig.class);
-            } catch (IOException e) {
-                Log.e(TAG, "Failed to load config file");
-                return null;
-            }
-            Log.i(TAG, "Use manager: " + config.useManager);
-            Log.i(TAG, "Signature bypass level: " + config.sigBypassLevel);
-
-            Path originPath = Paths.get(appInfo.dataDir, "cache/lspatch/origin/");
-            Path cacheApkPath;
-            try (ZipFile sourceFile = new ZipFile(appInfo.sourceDir)) {
-                cacheApkPath = originPath.resolve(sourceFile.getEntry(ORIGINAL_APK_ASSET_PATH).getCrc() + ".apk");
-            }
-
+    private static String prepareCacheApk(Context stubContext) throws IOException {
+        String cacheApk;
+        try (ZipFile sourceFile = new ZipFile(stubContext.getApplicationInfo().sourceDir)) {
+            ZipEntry entry = sourceFile.getEntry(ORIGINAL_APK_ASSET_PATH);
+            Path originPath = Paths.get(stubContext.getApplicationInfo().dataDir, "cache/lspatch/origin/");
+            Path cacheApkPath = originPath.resolve(entry.getCrc() + ".apk");
+            cacheApk = cacheApkPath.toString();
             if (!Files.exists(cacheApkPath)) {
                 Log.i(TAG, "Extract original apk");
                 FileUtils.deleteFolderIfExists(originPath);
                 Files.createDirectories(originPath);
-                try (InputStream is = baseClassLoader.getResourceAsStream(ORIGINAL_APK_ASSET_PATH)) {
+                try (InputStream is = sourceFile.getInputStream(entry)) {
                     Files.copy(is, cacheApkPath);
                 }
             }
+        }
+        return cacheApk;
+    }
 
-            String cacheApk = cacheApkPath.toString();
+    private static PatchConfig loadConfig(Context context) {
+        try (var is = context.getClassLoader().getResourceAsStream(CONFIG_ASSET_PATH)) {
+            BufferedReader streamReader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+            return new Gson().fromJson(streamReader, PatchConfig.class);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static Context createStubContext() {
+        try {
+            var mBoundApplication = XposedHelpers.getObjectField(activityThread, "mBoundApplication");
+            var stubLoadedApk = (LoadedApk) XposedHelpers.getObjectField(mBoundApplication, "info");
+            var appInfo = (ApplicationInfo) XposedHelpers.getObjectField(mBoundApplication, "appInfo");
+
+            // clear appComponentFactory to prevent loop
+            appInfo.appComponentFactory = null;
+            stubLoadedApk.getClassLoader(); // trigger getClassLoader()
+            return (Context) XposedHelpers.callStaticMethod(Class.forName("android.app.ContextImpl"), "createAppContext", activityThread, stubLoadedApk);
+        } catch (Throwable e) {
+            Log.e(TAG, "createStubContext", e);
+            return null;
+        }
+    }
+
+    private static void switchLoadedApk(Context stubContext, String cacheApk) {
+        try {
+            var mBoundApplication = XposedHelpers.getObjectField(activityThread, "mBoundApplication");
+            var stubLoadedApk = (LoadedApk) XposedHelpers.getObjectField(mBoundApplication, "info");
+            var appInfo = (ApplicationInfo) XposedHelpers.getObjectField(mBoundApplication, "appInfo");
+            var compatInfo = (CompatibilityInfo) XposedHelpers.getObjectField(mBoundApplication, "compatInfo");
+
             // update existing ApplicationInfo
             updateApplicationInfo(appInfo, cacheApk);
             updateApplicationInfoInMessageQueue(appInfo.packageName, cacheApk);
             // update future ApplicationInfo
             proxyApplicationInfoCreator(appInfo.packageName, cacheApk);
 
+            // clear cache before getPackageInfoNoCheck
             var mPackages = (Map<?, ?>) XposedHelpers.getObjectField(activityThread, "mPackages");
             mPackages.remove(appInfo.packageName);
-            appLoadedApk = activityThread.getPackageInfoNoCheck(appInfo, compatInfo);
+
+            // create a fresh LoadedApk and trigger LoadedApkCtorHooker
+            LoadedApk appLoadedApk = activityThread.getPackageInfoNoCheck(appInfo, compatInfo);
+
+            // start restore reference to appLoadedApk
             XposedHelpers.setObjectField(mBoundApplication, "info", appLoadedApk);
+            XposedHelpers.setObjectField(stubContext, "mPackageInfo", appLoadedApk);
 
             var activityClientRecordClass = XposedHelpers.findClass("android.app.ActivityThread$ActivityClientRecord", ActivityThread.class.getClassLoader());
             var fixActivityClientRecord = (BiConsumer<Object, Object>) (k, v) -> {
@@ -182,21 +225,42 @@ public class LSPApplication {
                 }
             } catch (Throwable ignored) {
             }
+            // end restore reference to appLoadedApk
+
+            // at org.lsposed.lspatch.metaloader.LSPAppComponentFactoryStub.<clinit>(Unknown Source:383)  <-- we are here
+            // at android.app.LoadedApk.createAppFactory(LoadedApk.java:268)
+            // at android.app.LoadedApk.createOrUpdateClassLoaderLocked(LoadedApk.java:910)
+            // at android.app.LoadedApk.getClassLoader(LoadedApk.java:990)
+            // at android.app.LoadedApk.getResources(LoadedApk.java:1222) <-- we are called by LoadedApk.getResources
+            // at android.app.ContextImpl.createAppContext(ContextImpl.java:2663)
+            // at android.app.ContextImpl.createAppContext(ContextImpl.java:2655)
+
+            // call to appLoadedApk.getResources same as ContextImpl.createAppContext, and
+            // trigger new AppComponentFactory().instantiateClassLoader()
+            // trigger LoadedApkGetCLHooker to load xposed modules
+            Resources appResources = (Resources) XposedHelpers.callMethod(appLoadedApk, "getResources");
+
+            // replace ClassLoaders in stubLoadedApk
+            switchAllClassLoader(stubLoadedApk, appLoadedApk);
+
+            // at org.lsposed.lspatch.metaloader.LSPAppComponentFactoryStub.<clinit>(Unknown Source:383)  <-- we are here
+            // at android.app.LoadedApk.createAppFactory(LoadedApk.java:268)
+            // at android.app.LoadedApk.createOrUpdateClassLoaderLocked(LoadedApk.java:910)
+            // at android.app.LoadedApk.getClassLoader(LoadedApk.java:990)
+            // at android.app.LoadedApk.getResources(LoadedApk.java:1222)
+            // at android.app.ContextImpl.createAppContext(ContextImpl.java:2663)
+            // at android.app.ContextImpl.createAppContext(ContextImpl.java:2655) <- ContextImpl create here
+            // at android.app.ActivityThread.handleBindApplication(ActivityThread.java:6602)
+
+            // stubLoadedApk is still referenced by a ContextImpl,
+            // and we can't get the ContextImpl by reflection.
+            // hook ContextImpl methods to set appLoadedApk & appResources
+            replaceLoadedApkInContextImpl(stubLoadedApk, appLoadedApk, appResources);
+
             Log.i(TAG, "hooked app initialized: " + appLoadedApk);
 
-            var context = (Context) XposedHelpers.callStaticMethod(Class.forName("android.app.ContextImpl"), "createAppContext", activityThread, stubLoadedApk);
-            if (config.appComponentFactory != null) {
-                try {
-                    context.getClassLoader().loadClass(config.appComponentFactory);
-                } catch (ClassNotFoundException e) { // This will happen on some strange shells like 360
-                    Log.w(TAG, "Original AppComponentFactory not found: " + config.appComponentFactory);
-                    appInfo.appComponentFactory = null;
-                }
-            }
-            return context;
         } catch (Throwable e) {
-            Log.e(TAG, "createLoadedApk", e);
-            return null;
+            Log.e(TAG, "switchLoadedApk", e);
         }
     }
 
@@ -337,7 +401,7 @@ public class LSPApplication {
 //        }
     }
 
-    private static void switchAllClassLoader() {
+    private static void switchAllClassLoader(LoadedApk stubLoadedApk, LoadedApk appLoadedApk) {
         var fields = LoadedApk.class.getDeclaredFields();
         for (Field field : fields) {
             if (field.getType() == ClassLoader.class) {
@@ -433,4 +497,45 @@ public class LSPApplication {
             }
         }
     }
+
+    private static void replaceLoadedApkInContextImpl(LoadedApk stubLoadedApk, LoadedApk appLoadedApk, Resources appResources) {
+        Class<?> cContextImpl = XposedHelpers.findClass("android.app.ContextImpl", ActivityThread.class.getClassLoader());
+        List<XC_MethodHook.Unhook> unhooks = new ArrayList<>();
+        for (Method m : cContextImpl.getDeclaredMethods()) {
+            if (Modifier.isStatic(m.getModifiers())) {
+                continue;
+            }
+            unhooks.add(XposedBridge.hookMethod(m, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    // Android 11
+                    // at LSPHooker_.getResources(Unknown Source:8) <-- beforeHookedMethod is called here
+                    // at android.app.ActivityThread.updateLocaleListFromAppContext(ActivityThread.java:6363)
+                    // at android.app.ActivityThread.handleBindApplication(ActivityThread.java:6603)
+
+                    // Android 13
+                    // at LSPHooker_.checkPermission(Unknown Source:25) <-- beforeHookedMethod is called here
+                    // at android.app.ContextImpl.isSystemOrSystemUI(ContextImpl.java:2157)
+                    // at android.app.ContextImpl.createAppContext(ContextImpl.java:3091)
+                    // at android.app.ContextImpl.createAppContext(ContextImpl.java:3082)
+                    // at android.app.ActivityThread.handleBindApplication(ActivityThread.java:6676)
+                    if (XposedHelpers.getObjectField(param.thisObject, "mPackageInfo") == stubLoadedApk) {
+                        XposedHelpers.setObjectField(param.thisObject, "mPackageInfo", appLoadedApk);
+                        Log.i(TAG, "replaced mPackageInfo in " + param.thisObject);
+                        for (Unhook unhook : unhooks) {
+                            unhook.unhook();
+                        }
+                        if (appResources != null) {
+                            if (param.method.getName().equals("setResources")) {
+                                param.args[0] = appResources;
+                            } else {
+                                XposedHelpers.callMethod(param.thisObject, "setResources", appResources);
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+    }
+
 }
