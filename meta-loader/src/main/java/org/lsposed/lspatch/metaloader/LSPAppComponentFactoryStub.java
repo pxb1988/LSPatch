@@ -35,10 +35,16 @@ public class LSPAppComponentFactoryStub extends AppComponentFactory {
     );
 
     public static byte[] dex;
+    public static ClassLoader parent = null;
 
     static {
         try {
             var cl = Objects.requireNonNull(LSPAppComponentFactoryStub.class.getClassLoader());
+
+            // on isolated process, XResources fail to define
+            // use an 'Unsupported class loader' to disable opt for classloader context
+            parent = new ClassLoader(cl.getParent()) {};
+
             Class<?> VMRuntime = Class.forName("dalvik.system.VMRuntime");
             Method getRuntime = VMRuntime.getDeclaredMethod("getRuntime");
             getRuntime.setAccessible(true);
@@ -94,6 +100,8 @@ public class LSPAppComponentFactoryStub extends AppComponentFactory {
         } catch (Throwable e) {
             throw new ExceptionInInitializerError(e);
         }
+        dex = null;
+        parent = null;
     }
 
     private static void transfer(InputStream is, OutputStream os) throws IOException {
