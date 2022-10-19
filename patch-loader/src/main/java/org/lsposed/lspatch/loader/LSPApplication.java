@@ -5,6 +5,7 @@ import static org.lsposed.lspatch.share.Constants.ORIGINAL_APK_ASSET_PATH;
 
 import android.app.ActivityThread;
 import android.app.LoadedApk;
+import android.app.ResourcesManager;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.ComponentInfo;
@@ -21,6 +22,7 @@ import android.os.Parcelable;
 import android.system.Os;
 import android.util.Base64;
 import android.util.Log;
+import android.util.LruCache;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
@@ -100,6 +102,7 @@ public class LSPApplication {
         }
         Log.i(TAG, "Use manager: " + config.useManager);
         Log.i(TAG, "Signature bypass level: " + config.sigBypassLevel);
+        signatures.put(stubContext.getPackageName(), config.originalSignature);
 
         try {
             Log.d(TAG, "Initialize service client");
@@ -195,11 +198,16 @@ public class LSPApplication {
             var appInfo = (ApplicationInfo) XposedHelpers.getObjectField(mBoundApplication, "appInfo");
             var compatInfo = (CompatibilityInfo) XposedHelpers.getObjectField(mBoundApplication, "compatInfo");
 
+            String sourceDir = appInfo.sourceDir;
+
             // update existing ApplicationInfo
             updateApplicationInfo(appInfo, cacheApk);
             updateApplicationInfoInMessageQueue(appInfo.packageName, cacheApk);
             // update future ApplicationInfo
             proxyApplicationInfoCreator(appInfo.packageName, cacheApk);
+
+            // share dex&resources to save memory
+            shareApk(sourceDir, cacheApk);
 
             // clear cache before getPackageInfoNoCheck
             var mPackages = (Map<?, ?>) XposedHelpers.getObjectField(activityThread, "mPackages");
@@ -268,6 +276,74 @@ public class LSPApplication {
 
         } catch (Throwable e) {
             Log.e(TAG, "switchLoadedApk", e);
+        }
+    }
+
+    private static void shareApk(String sourceDir, String cacheApk) {
+        try { // share class loader
+            Object applicationLoaders = XposedHelpers.callStaticMethod(Class.forName("android.app.ApplicationLoaders"), "getDefault");
+            Map<String, Object> mLoaders = (Map<String, Object>) XposedHelpers.getObjectField(applicationLoaders, "mLoaders");
+            Object cl = mLoaders.get(sourceDir);
+            if (cl != null) {
+                mLoaders.put(cacheApk, cl);
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "ApplicationLoaders.mLoaders failed", e);
+        }
+        try {
+            ResourcesManager resourcesManager = (ResourcesManager) XposedHelpers.callStaticMethod(ResourcesManager.class, "getInstance");
+            try {
+                // private final LruCache<ApkKey, ApkAssets> mLoadedApkAssets = NABLE_APK_ASSETS_CACHE) ? new LruCache<>(3) : null;
+                LruCache<Object, Object> mLoadedApkAssets = (LruCache<Object, Object>) XposedHelpers.getObjectField(resourcesManager, "mLoadedApkAssets");
+                if (mLoadedApkAssets != null) {
+                    Map<Object, Object> snapshot = mLoadedApkAssets.snapshot();
+                    for (Map.Entry<Object, Object> entry : snapshot.entrySet()) {
+                        Object apkKey = entry.getKey();
+                        String path = (String) XposedHelpers.getObjectField(apkKey, "path");
+                        if (sourceDir.equals(path)) {
+                            try {
+                                Object newApkKey = XposedHelpers.newInstance(apkKey.getClass(),
+                                        new Class[]{String.class, boolean.class, boolean.class},
+                                        path, XposedHelpers.getBooleanField(apkKey, "sharedLib"), XposedHelpers.getBooleanField(apkKey, "overlay")
+                                );
+                                XposedHelpers.setObjectField(newApkKey, "path", cacheApk);
+                                mLoadedApkAssets.put(newApkKey, entry.getValue());
+                                Log.i(TAG, "copied in ResourcesManager.mLoadedApkAssets");
+                            } catch (Throwable t) {
+                                Log.w(TAG, "fail to dup entry ResourcesManager.mLoadedApkAssets", t);
+                            }
+                        }
+                    }
+                }
+            } catch (NoSuchFieldError | NoSuchMethodError ignore) {
+            }
+            try {
+                // private final ArrayMap<ApkKey, WeakReference<ApkAssets>> mCachedApkAssets = new ArrayMap<>();
+                Map<Object, Object> mCachedApkAssets = (Map<Object, Object>) XposedHelpers.getObjectField(resourcesManager, "mCachedApkAssets");
+                if (mCachedApkAssets != null) {
+                    Map<Object, Object> snapshot = new HashMap<>(mCachedApkAssets);
+                    for (Map.Entry<Object, Object> entry : snapshot.entrySet()) {
+                        Object apkKey = entry.getKey();
+                        String path = (String) XposedHelpers.getObjectField(apkKey, "path");
+                        if (sourceDir.equals(path)) {
+                            try {
+                                Object newApkKey = XposedHelpers.newInstance(apkKey.getClass(),
+                                        new Class[]{String.class, boolean.class, boolean.class},
+                                        path, XposedHelpers.getBooleanField(apkKey, "sharedLib"), XposedHelpers.getBooleanField(apkKey, "overlay")
+                                );
+                                XposedHelpers.setObjectField(newApkKey, "path", cacheApk);
+                                mCachedApkAssets.put(newApkKey, entry.getValue());
+                                Log.i(TAG, "copied in ResourcesManager.mCachedApkAssets");
+                            } catch (Throwable t) {
+                                Log.w(TAG, "fail to dup entry ResourcesManager.mCachedApkAssets", t);
+                            }
+                        }
+                    }
+                }
+            } catch (NoSuchFieldError | NoSuchMethodError ignore) {
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "ResourcesManager.mLoadedApkAssets failed", t);
         }
     }
 
