@@ -7,11 +7,14 @@ import android.app.ActivityThread;
 import android.app.LoadedApk;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.ComponentInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.content.res.CompatibilityInfo;
 import android.os.Build;
+import android.os.Looper;
+import android.os.Message;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.system.Os;
@@ -28,7 +31,6 @@ import org.lsposed.lspatch.service.RemoteApplicationService;
 import org.lsposed.lspatch.share.Constants;
 import org.lsposed.lspatch.share.PatchConfig;
 import org.lsposed.lspd.core.Startup;
-import org.lsposed.lspd.nativebridge.SigBypass;
 import org.lsposed.lspd.service.ILSPApplicationService;
 
 import java.io.BufferedReader;
@@ -38,6 +40,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -138,10 +141,6 @@ public class LSPApplication {
                 cacheApkPath = originPath.resolve(sourceFile.getEntry(ORIGINAL_APK_ASSET_PATH).getCrc() + ".apk");
             }
 
-            appInfo.sourceDir = cacheApkPath.toString();
-            appInfo.publicSourceDir = cacheApkPath.toString();
-            appInfo.appComponentFactory = config.appComponentFactory;
-
             if (!Files.exists(cacheApkPath)) {
                 Log.i(TAG, "Extract original apk");
                 FileUtils.deleteFolderIfExists(originPath);
@@ -150,6 +149,13 @@ public class LSPApplication {
                     Files.copy(is, cacheApkPath);
                 }
             }
+
+            String cacheApk = cacheApkPath.toString();
+            // update existing ApplicationInfo
+            updateApplicationInfo(appInfo, cacheApk);
+            updateApplicationInfoInMessageQueue(appInfo.packageName, cacheApk);
+            // update future ApplicationInfo
+            proxyApplicationInfoCreator(appInfo.packageName, cacheApk);
 
             var mPackages = (Map<?, ?>) XposedHelpers.getObjectField(activityThread, "mPackages");
             mPackages.remove(appInfo.packageName);
@@ -163,6 +169,7 @@ public class LSPApplication {
                     if (pkgInfo == stubLoadedApk) {
                         Log.d(TAG, "fix loadedapk from ActivityClientRecord");
                         XposedHelpers.setObjectField(v, "packageInfo", appLoadedApk);
+                        updateApplicationInfoInObjectFields(v, appInfo.packageName, cacheApk);
                     }
                 }
             };
@@ -294,6 +301,10 @@ public class LSPApplication {
             }
         };
         XposedHelpers.setStaticObjectField(PackageInfo.class, "CREATOR", proxiedCreator);
+        clearCreatorCache();
+    }
+
+    private static void clearCreatorCache() {
         try {
             Map<?, ?> mCreators = (Map<?, ?>) XposedHelpers.getStaticObjectField(Parcel.class, "mCreators");
             mCreators.clear();
@@ -315,13 +326,15 @@ public class LSPApplication {
             XLog.d(TAG, "Original signature: " + config.originalSignature.substring(0, 16) + "...");
             proxyPackageInfoCreator(context);
         }
-        if (config.sigBypassLevel >= Constants.SIGBYPASS_LV_PM_OPENAT) {
-            String cacheApkPath;
-            try (ZipFile sourceFile = new ZipFile(context.getPackageResourcePath())) {
-                cacheApkPath = context.getCacheDir() + "/lspatch/origin/" + sourceFile.getEntry(ORIGINAL_APK_ASSET_PATH).getCrc() + ".apk";
-            }
-            SigBypass.enableOpenatHook(context.getPackageResourcePath(), cacheApkPath);
-        }
+        // the ApplicationInfo from Parcel api always indicate cacheApk is the sourceDir,
+        // so SIGBYPASS_LV_PM_OPENAT is not required any more
+//        if (config.sigBypassLevel >= Constants.SIGBYPASS_LV_PM_OPENAT) {
+//            String cacheApkPath;
+//            try (ZipFile sourceFile = new ZipFile(context.getPackageResourcePath())) {
+//                cacheApkPath = context.getCacheDir() + "/lspatch/origin/" + sourceFile.getEntry(ORIGINAL_APK_ASSET_PATH).getCrc() + ".apk";
+//            }
+//            SigBypass.enableOpenatHook(context.getPackageResourcePath(), cacheApkPath);
+//        }
     }
 
     private static void switchAllClassLoader() {
@@ -330,6 +343,93 @@ public class LSPApplication {
             if (field.getType() == ClassLoader.class) {
                 var obj = XposedHelpers.getObjectField(appLoadedApk, field.getName());
                 XposedHelpers.setObjectField(stubLoadedApk, field.getName(), obj);
+            }
+        }
+    }
+
+    private static void updateApplicationInfo(ApplicationInfo appInfo, String cacheApk) {
+        appInfo.sourceDir = cacheApk;
+        appInfo.publicSourceDir = cacheApk;
+        appInfo.appComponentFactory = null;
+        if (config.appComponentFactory != null && config.appComponentFactory.length() > 0) {
+            if (config.appComponentFactory.startsWith(".")) {
+                appInfo.appComponentFactory = appInfo.packageName + config.appComponentFactory;
+            } else {
+                appInfo.appComponentFactory = config.appComponentFactory;
+            }
+        }
+    }
+
+    private static void proxyApplicationInfoCreator(String packageName, String cacheApk) {
+        Parcelable.Creator<ApplicationInfo> originalCreator = ApplicationInfo.CREATOR;
+        Parcelable.Creator<ApplicationInfo> proxiedCreator = new Parcelable.Creator<ApplicationInfo>() {
+            @Override
+            public ApplicationInfo createFromParcel(Parcel source) {
+                ApplicationInfo applicationInfo = originalCreator.createFromParcel(source);
+                if (applicationInfo != null && applicationInfo.packageName.equals(packageName)) {
+                    updateApplicationInfo(applicationInfo, cacheApk);
+                }
+                return applicationInfo;
+            }
+
+            @Override
+            public ApplicationInfo[] newArray(int size) {
+                return originalCreator.newArray(size);
+            }
+        };
+        XposedHelpers.setStaticObjectField(ApplicationInfo.class, "CREATOR", proxiedCreator);
+        clearCreatorCache();
+    }
+
+    private static void updateApplicationInfoInMessageQueue(String packageName, String cacheApk) {
+        try {
+            // CreateServiceData may pending in MessageQueue
+            // Looper (main, tid 2) {9408ff5}
+            //   Message 0: { when=-153ms what=114 obj=CreateServiceData{...} target=android.app.ActivityThread$H }
+            //   Message 1: { when=-153ms what=121 obj=BindServiceData{...} target=android.app.ActivityThread$H }
+            //     (Total messages: 2, polling=false, quitting=false)
+
+            Message msg = (Message) XposedHelpers.getObjectField(Looper.getMainLooper().getQueue(), "mMessages");
+            while (msg != null) {
+                if (msg.obj != null) {
+                    if (msg.obj.getClass().getName().startsWith("android.app.ActivityThread$")) {
+                        updateApplicationInfoInObjectFields(msg.obj, packageName, cacheApk);
+                    }
+                }
+                msg = (Message) XposedHelpers.getObjectField(msg, "next");
+            }
+        } catch (NoSuchFieldError ignore) {
+        } catch (Throwable e) {
+            Log.w(TAG, "fail to clear CreateServiceData", e);
+        }
+    }
+
+    // android.app.ActivityThread$CreateServiceData.info
+    // android.app.ActivityThread$ActivityClientRecord.activityInfo
+    private static void updateApplicationInfoInObjectFields(Object obj, String packageName, String cacheApk) {
+        if (obj == null) {
+            return;
+        }
+        for (Field field : obj.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers())) {
+                continue; // skip static field
+            }
+            if (!ComponentInfo.class.isAssignableFrom(field.getType())) {
+                continue; // skip unknown field
+            }
+            ComponentInfo componentInfo;
+            try {
+                field.setAccessible(true);
+                componentInfo = (ComponentInfo) field.get(obj);
+            } catch (SecurityException | IllegalArgumentException | IllegalAccessException ignore) {
+                continue; // skip failed
+            }
+            if (componentInfo == null || componentInfo.applicationInfo == null) {
+                continue; // skip null value
+            }
+            Log.d(TAG, "update " + field);
+            if (packageName.equals(componentInfo.packageName)) {
+                updateApplicationInfo(componentInfo.applicationInfo, cacheApk);
             }
         }
     }
