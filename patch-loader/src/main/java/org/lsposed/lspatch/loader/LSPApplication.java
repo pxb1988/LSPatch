@@ -28,10 +28,12 @@ import com.google.gson.JsonSyntaxException;
 import org.lsposed.lspatch.loader.util.FileUtils;
 import org.lsposed.lspatch.loader.util.XLog;
 import org.lsposed.lspatch.service.LocalApplicationService;
+import org.lsposed.lspatch.service.NullApplicationService;
 import org.lsposed.lspatch.service.RemoteApplicationService;
 import org.lsposed.lspatch.share.Constants;
 import org.lsposed.lspatch.share.PatchConfig;
 import org.lsposed.lspd.core.Startup;
+import org.lsposed.lspd.nativebridge.SigBypass;
 import org.lsposed.lspd.service.ILSPApplicationService;
 
 import java.io.BufferedReader;
@@ -82,10 +84,6 @@ public class LSPApplication {
     }
 
     public static void onLoad() {
-        if (isIsolated()) {
-            XLog.d(TAG, "Skip isolated process");
-            return;
-        }
         activityThread = ActivityThread.currentActivityThread();
         Log.i(TAG, "Create stub Context");
         var stubContext = createStubContext();
@@ -106,13 +104,18 @@ public class LSPApplication {
         try {
             Log.d(TAG, "Initialize service client");
             ILSPApplicationService service;
-            if (config.useManager) {
-                service = new RemoteApplicationService(stubContext);
+            if (isIsolated()) {
+                // not enable RemoteApplicationService in isolated process
+                // Caused by: java.lang.SecurityException: Isolated process not allowed to call getContentProvider
+                service = new NullApplicationService();
             } else {
-                service = new LocalApplicationService(stubContext);
+                if (config.useManager) {
+                    service = new RemoteApplicationService(stubContext);
+                } else {
+                    service = new LocalApplicationService(stubContext);
+                }
+                disableProfile(stubContext);
             }
-
-            disableProfile(stubContext);
 
             // start Main.forkCommon
             Startup.initXposed(false, ActivityThread.currentProcessName(), service);
@@ -138,6 +141,10 @@ public class LSPApplication {
     }
 
     private static String prepareCacheApk(Context stubContext) throws IOException {
+        if (isIsolated()) {
+            SigBypass.enhanceOpenat();
+            return stubContext.getApplicationInfo().sourceDir + "!/" + ORIGINAL_APK_ASSET_PATH;
+        }
         String cacheApk;
         try (ZipFile sourceFile = new ZipFile(stubContext.getApplicationInfo().sourceDir)) {
             ZipEntry entry = sourceFile.getEntry(ORIGINAL_APK_ASSET_PATH);
